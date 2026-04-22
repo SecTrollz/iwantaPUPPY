@@ -1,0 +1,318 @@
+{
+  "name": "smallsizedpuppy.SB - Real-Time with Humanization",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "craigslist-instant",
+        "responseMode": "onReceived"
+      },
+      "id": "craigslist-webhook",
+      "name": "Craigslist Webhook (changedetection.io)",
+      "type": "n8n-nodes-base.webhook",
+      "position": [100, 300]
+    },
+    {
+      "parameters": {
+        "path": "fb-marketplace-webhook",
+        "responseMode": "onReceived"
+      },
+      "id": "fb-webhook",
+      "name": "Facebook Marketplace Webhook (Meta)",
+      "type": "n8n-nodes-base.webhook",
+      "position": [100, 480]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize incoming data from either source\nlet raw = $input.first().json;\nif (raw.entry) raw = raw.entry[0].changes[0].value; // Facebook format\nif (raw.rss) raw = raw.rss.channel.item; // RSS format\n\nconst listing = {\n  title: raw.title || raw.name || '',\n  description: raw.description || raw.content || raw.message || '',\n  url: raw.link || raw.url || raw.permalink || '',\n  price: raw.price || raw.amount || ''\n};\nreturn [listing];"
+      },
+      "id": "normalizer",
+      "name": "Normalize Listing Data",
+      "type": "n8n-nodes-base.code",
+      "position": [300, 390]
+    },
+    {
+      "parameters": {
+        "command": "python3 /home/ubuntu/smallsizedpuppy/scraper.py --url '={{ $json.url }}'"
+      },
+      "id": "scrape",
+      "name": "Scrape Full Details & Images",
+      "type": "n8n-nodes-base.executeCommand",
+      "position": [500, 390]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a high-speed filter. Output ONLY JSON: {\"accepted\": boolean, \"reason\": string, \"breed\": string, \"age_estimate\": string, \"price_clean\": string}. Accept ONLY if: breed is tiny (Chihuahua, Yorkie, Maltese, Pomeranian, Toy Poodle, etc.), age under 4 years, price is $0 or negotiable to $0. Reject anything larger or older."
+            },
+            {
+              "role": "user",
+              "content": "Title: {{ $json.title }}\nDescription: {{ $json.description }}\nPrice: {{ $json.price }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.1,
+          "response_format": { "type": "json_object" }
+        }
+      },
+      "id": "ai-filter",
+      "name": "AI Filter (GPT-4)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "position": [700, 390]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.accepted }}",
+              "operation": "equals",
+              "value2": "true"
+            }
+          ]
+        }
+      },
+      "id": "if-accepted",
+      "name": "Passed Filter?",
+      "type": "n8n-nodes-base.if",
+      "position": [900, 390]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check database for duplicate listing\nconst sqlite3 = require('sqlite3').verbose();\nconst path = '/home/ubuntu/smallsizedpuppy/data/listings.db';\nconst db = new sqlite3.Database(path);\nconst url = $input.first().json.url;\nconst isDuplicate = await new Promise((resolve) => {\n  db.get('SELECT id FROM seen_listings WHERE url = ?', [url], (err, row) => {\n    if (err || row) resolve(true);\n    else {\n      db.run('INSERT INTO seen_listings (url, title) VALUES (?, ?)', [url, $input.first().json.title]);\n      resolve(false);\n    }\n    db.close();\n  });\n});\nreturn [{ ...$input.first().json, isDuplicate }];"
+      },
+      "id": "dedupe",
+      "name": "Check Duplicate",
+      "type": "n8n-nodes-base.code",
+      "position": [1100, 390]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.isDuplicate }}",
+              "operation": "equals",
+              "value2": "false"
+            }
+          ]
+        }
+      },
+      "id": "if-new",
+      "name": "New Listing?",
+      "type": "n8n-nodes-base.if",
+      "position": [1300, 390]
+    },
+    {
+      "parameters": {
+        "url": "https://discord.com/api/v10/channels/YOUR_APPROVAL_CHANNEL_ID/messages",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bot YOUR_DISCORD_BOT_TOKEN"
+            }
+          ]
+        },
+        "body": {
+          "content": "=**🚨 Puppy Alert**\n**Title:** {{ $json.title }}\n**Price:** {{ $json.price }}\n**Breed guess:** {{ $json.breed }}\n**URL:** {{ $json.url }}\n\n**Images:**\n{{ $json.images.map(i => `- ${i}`).join('\\n') }}\n\nReply with `!approve {{ $json.url }}` to send message to seller.",
+          "files": []
+        }
+      },
+      "id": "send-to-discord",
+      "name": "Send to Discord Approval Channel",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1500, 390]
+    },
+    {
+      "parameters": {
+        "path": "discord-approval",
+        "method": "POST",
+        "responseMode": "responseNode"
+      },
+      "id": "approval-webhook",
+      "name": "Wait for Discord !approve",
+      "type": "n8n-nodes-base.webhook",
+      "webhookId": "discord-approval",
+      "position": [1700, 390]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract URL from approval command\nconst content = $input.first().json.message.content;\nconst match = content.match(/!approve\\s+(\\S+)/);\nconst url = match ? match[1] : null;\nif (!url) throw new Error('No URL in approval command');\n// Fetch full listing from database or pass through\nreturn [{ url, ...$input.first().json }];"
+      },
+      "id": "parse-approval",
+      "name": "Parse Approval Command",
+      "type": "n8n-nodes-base.code",
+      "position": [1900, 390]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are Evan. Write a message to a puppy seller. Follow these humanization rules STRICTLY:\n- Vary sentence length (burstiness). Use some short sentences.\n- Never use: 'furthermore', 'moreover', 'additionally', 'delve', 'vibrant'.\n- No bullet points, em-dashes, or emojis.\n- Start one sentence with 'And' or 'But' occasionally.\n- Use one sentence fragment (e.g., 'Just a thought.').\n- End naturally, not a perfect summary. Ask an open question.\n- Mention: your ill stepchild needs a small lap dog (under 10 lbs).\n- Ask for: exact age, current size, health.\n- If rehoming fee mentioned: say 'I understand fees help, but if you ever consider waiving it for a sick child, that would be a miracle. Either way, I'm grateful.'\n- Sign as 'Evan'."
+            },
+            {
+              "role": "user",
+              "content": "Seller's listing: Title {{ $json.title }}, Price {{ $json.price }}, Description {{ $json.description }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.8,
+          "maxTokens": 300
+        }
+      },
+      "id": "humanizer",
+      "name": "Draft Humanized Message (Evan)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "position": [2100, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://discord.com/api/v10/channels/YOUR_APPROVAL_CHANNEL_ID/threads",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bot YOUR_DISCORD_BOT_TOKEN"
+            }
+          ]
+        },
+        "body": {
+          "name": "=Puppy: {{ $json.title.substring(0, 50) }}",
+          "message": {
+            "content": "=**Conversation with seller**\n\n**Your message (Evan):**\n{{ $json.message }}\n\n---\nSeller replies will appear here automatically.\n\nWhen meetup is scheduled, type `!schedule [date] [contact info]`"
+          }
+        }
+      },
+      "id": "create-thread",
+      "name": "Create Discord Thread",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2100, 450]
+    },
+    {
+      "parameters": {
+        "fromEmail": "w.t.f@mf.me",
+        "toEmail": "={{ $json.seller_email || $json.contact_email || 'craigslist-anon@example.com' }}",
+        "subject": "Question about your small puppy",
+        "text": "={{ $json.message }}"
+      },
+      "id": "send-email",
+      "name": "Send Email (Craigslist)",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [2300, 250]
+    },
+    {
+      "parameters": {
+        "recipientId": "={{ $json.seller_fb_id }}",
+        "message": "={{ $json.message }}",
+        "accessToken": "YOUR_FB_PAGE_ACCESS_TOKEN"
+      },
+      "id": "send-fb",
+      "name": "Send Facebook Message",
+      "type": "n8n-nodes-base.facebookMessenger",
+      "position": [2300, 400]
+    },
+    {
+      "parameters": {
+        "path": "seller-reply",
+        "method": "POST",
+        "responseMode": "onReceived"
+      },
+      "id": "reply-webhook",
+      "name": "Capture Seller Email Replies",
+      "type": "n8n-nodes-base.webhook",
+      "position": [2500, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Route reply to correct Discord thread\nconst reply = $input.first().json;\n// In production: lookup thread_id from database using reply's original listing URL\n// For now, assume thread_id passed in webhook\nconst threadId = reply.thread_id;\nconst content = `**Seller replied:**\\n${reply.body}`;\nreturn [{ threadId, content }];"
+      },
+      "id": "route-reply",
+      "name": "Route Reply to Thread",
+      "type": "n8n-nodes-base.code",
+      "position": [2700, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://discord.com/api/v10/channels/{{ $json.threadId }}/messages",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bot YOUR_DISCORD_BOT_TOKEN"
+            }
+          ]
+        },
+        "body": {
+          "content": "={{ $json.content }}"
+        }
+      },
+      "id": "log-reply",
+      "name": "Log Reply to Discord Thread",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2900, 300]
+    },
+    {
+      "parameters": {
+        "path": "schedule-meetup",
+        "method": "POST",
+        "responseMode": "onReceived"
+      },
+      "id": "schedule-webhook",
+      "name": "Handle !schedule Command",
+      "type": "n8n-nodes-base.webhook",
+      "position": [3100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse !schedule command from Discord\nconst cmd = $input.first().json.message.content;\nconst match = cmd.match(/!schedule\\s+(.+?)\\s+(.+)/);\nconst dateTime = match ? match[1] : 'unknown';\nconst contactInfo = match ? match[2] : 'unknown';\nconst alert = `📢 **GET YO DAMN FREE SMALL LITTLE DOG**\\nFrom: ${$input.first().json.seller_name || 'seller'}\\nMeet scheduled for: ${dateTime}\\nContact info: ${contactInfo}\\n\\nText Evan: 4243353756`;\n// Send SMS via email-to-SMS gateway\nconst smsEmail = `4243353756@mms.att.net`; // Adjust carrier as needed\nreturn [{ alert, smsEmail, contactInfo, dateTime }];"
+      },
+      "id": "schedule-parser",
+      "name": "Parse !schedule & Create Alert",
+      "type": "n8n-nodes-base.code",
+      "position": [3300, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "w.t.f@mf.me",
+        "toEmail": "={{ $json.smsEmail }}",
+        "subject": "PUPPY MEETUP SCHEDULED",
+        "text": "={{ $json.alert }}"
+      },
+      "id": "send-sms",
+      "name": "Send SMS Alert to Evan",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [3500, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_DISCORD_USER_ID",
+        "text": "={{ $json.alert }}"
+      },
+      "id": "dm-alert",
+      "name": "Send Discord DM to Evan",
+      "type": "n8n-nodes-base.discord",
+      "position": [3500, 450]
+    }
+  ]
+}
